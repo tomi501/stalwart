@@ -1,0 +1,332 @@
+name: Sync upstream and apply fork customisations
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/stalwartlabs/stalwart.git
+          git fetch upstream
+          git fetch origin
+
+      - name: Determine old and new upstream SHAs
+        id: get_shas
+        run: |
+          NEW_SHA=$(git rev-parse upstream/main)
+          if git rev-parse --verify origin/customized >/dev/null 2>&1; then
+            OLD_SHA=$(git rev-parse origin/customized~1)
+          else
+            OLD_SHA=$(git rev-list --max-parents=0 upstream/main)
+          fi
+          echo "old_sha=$OLD_SHA" >> $GITHUB_OUTPUT
+          echo "new_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+
+      - name: Exit early if no new upstream commits
+        if: steps.get_shas.outputs.old_sha == steps.get_shas.outputs.new_sha
+        run: echo "No new upstream commits since last sync. Exiting."
+
+      - name: Build commit message
+        id: commit_msg
+        run: |
+          OLD_SHA="${{ steps.get_shas.outputs.old_sha }}"
+          NEW_SHA="${{ steps.get_shas.outputs.new_sha }}"
+          OLD_SHORT=$(git rev-parse --short $OLD_SHA)
+          NEW_SHORT=$(git rev-parse --short $NEW_SHA)
+          MSG="chore: sync to upstream/main ($OLD_SHORT..$NEW_SHORT)"
+          echo "msg=$MSG" >> $GITHUB_OUTPUT
+
+      - name: Update main via fast-forward
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+
+      - name: Reset customized branch to upstream/main
+        run: |
+          git branch -D customized || true
+          git checkout -b customized upstream/main
+
+      - name: Apply custom GitHub Actions workflows from fork-actions
+        run: |
+          if git rev-parse --verify origin/fork-actions >/dev/null 2>&1; then
+            git checkout origin/fork-actions -- .github/workflows/ || {
+              echo "⚠️  fork-actions branch exists but .github/workflows/ not found"
+              exit 1
+            }
+            git add .github/workflows/
+            echo "✅ Custom workflows applied"
+          else
+            echo "ℹ️  fork-actions branch does not exist; skipping workflow customization"
+          fi
+
+      - name: Validate license key format
+        env:
+          CUSTOM_KEY: ${{ vars.CUSTOM_PUBLIC_KEY_BYTES }}
+        run: |
+          if [ -z "$CUSTOM_KEY" ]; then
+            echo "❌ CUSTOM_PUBLIC_KEY_BYTES variable is empty"
+            exit 1
+          fi
+          COUNT=$(echo "$CUSTOM_KEY" | tr ',' '\n' | grep -c .)
+          if [ "$COUNT" -ne 32 ]; then
+            echo "❌ Expected 32 numbers, got $COUNT"
+            exit 1
+          fi
+          echo "✅ Key format validation passed (32 bytes)"
+
+      - name: Validate key authenticity via checksum
+        env:
+          CUSTOM_KEY: ${{ vars.CUSTOM_PUBLIC_KEY_BYTES }}
+          EXPECTED_KEY_SHA256: ${{ secrets.CUSTOM_PUBLIC_KEY_BYTES_SHA256 }}
+        run: |
+          if [ -z "$EXPECTED_KEY_SHA256" ]; then
+            echo "⚠️  CUSTOM_PUBLIC_KEY_BYTES_SHA256 not configured in secrets"
+            echo "    Skipping authenticity check. Configure it for production use."
+            echo "SKIP_AUTH_CHECK=true" >> $GITHUB_ENV
+          else
+            ACTUAL_SHA=$(echo -n "$CUSTOM_KEY" | sha256sum | cut -d' ' -f1)
+            if [ "$ACTUAL_SHA" = "$EXPECTED_KEY_SHA256" ]; then
+              echo "✅ Key authenticity verified (SHA256 matches)"
+            else
+              echo "❌ Key checksum mismatch! Refusing to proceed."
+              echo "   Expected: $EXPECTED_KEY_SHA256"
+              echo "   Actual:   $ACTUAL_SHA"
+              exit 1
+            fi
+          fi
+
+      - name: Validate upstream license.rs structure
+        env:
+          LICENSE_FILE_PATH: crates/common/src/enterprise/license.rs
+        run: |
+          if [ ! -f "$LICENSE_FILE_PATH" ]; then
+            echo "❌ License file not found at $LICENSE_FILE_PATH"
+            exit 1
+          fi
+
+          # Verify expected patterns exist
+          if ! grep -q "public_key:" "$LICENSE_FILE_PATH"; then
+            echo "❌ Expected 'public_key:' field not found in license.rs"
+            echo "   The upstream repo may have restructured this file."
+            exit 1
+          fi
+
+          if ! grep -q "UnparsedPublicKey::new" "$LICENSE_FILE_PATH"; then
+            echo "❌ Expected 'UnparsedPublicKey::new' constructor not found"
+            echo "   The upstream repo may have changed the license struct."
+            exit 1
+          fi
+
+          if ! grep -q "vec!\[" "$LICENSE_FILE_PATH"; then
+            echo "❌ Expected 'vec![' key storage not found"
+            echo "   The upstream repo may have changed the key storage format."
+            exit 1
+          fi
+
+          echo "✅ License file structure validated"
+
+      - name: Replace public key in license.rs
+        env:
+          CUSTOM_KEY: ${{ vars.CUSTOM_PUBLIC_KEY_BYTES }}
+          LICENSE_FILE_PATH: crates/common/src/enterprise/license.rs
+        run: |
+          python3 << 'PYTHON_EOF'
+          import os, sys, re
+
+          FILE_PATH = os.environ['LICENSE_FILE_PATH']
+          CUSTOM_KEY_RAW = os.environ['CUSTOM_KEY'].strip()
+          key_numbers = [x.strip() for x in CUSTOM_KEY_RAW.split(',') if x.strip()]
+
+          if len(key_numbers) != 32:
+              print(f'❌ Validation failed: expected 32 numbers, got {len(key_numbers)}')
+              sys.exit(1)
+
+          with open(FILE_PATH, 'r') as f:
+              original_content = f.read()
+
+          # Regex pattern: Match the public_key field with its vec![ ] block
+          # Pattern explanation:
+          #   - Match 'public_key:' followed by whitespace
+          #   - Match 'UnparsedPublicKey::new(' and its opening paren content
+          #   - Capture everything up to and including the comma after the vec![...],
+          pattern = r'(public_key:\s*UnparsedPublicKey::new\([^)]*,\s*)vec!\[([^\]]*)\],'
+
+          def replacement(match):
+              prefix = match.group(1)
+              
+              # Format key bytes into chunks of 16
+              chunk_size = 16
+              formatted_chunks = []
+              for i in range(0, len(key_numbers), chunk_size):
+                  chunk = key_numbers[i:i+chunk_size]
+                  formatted_chunks.append(', '.join(chunk))
+              
+              # Reconstruct vec with proper formatting
+              formatted_vec = 'vec![\n                    ' + ',\n                    '.join(formatted_chunks) + ',\n                ],'
+              return prefix + formatted_vec
+
+          new_content = re.sub(pattern, replacement, original_content, flags=re.DOTALL)
+
+          # Validation: Ensure replacement happened
+          if new_content == original_content:
+              print('❌ Failed to find and replace license key pattern')
+              print('   The upstream file structure may have changed.')
+              print('   Expected: public_key: UnparsedPublicKey::new(..., vec![...],')
+              sys.exit(1)
+
+          # Validation: Ensure exactly one match (no accidental multi-replace)
+          matches = len(re.findall(pattern, original_content, flags=re.DOTALL))
+          if matches != 1:
+              print(f'❌ Found {matches} matches for license key pattern (expected exactly 1)')
+              print('   The upstream file structure may be ambiguous.')
+              sys.exit(1)
+
+          with open(FILE_PATH, 'w') as f:
+              f.write(new_content)
+
+          print('✅ License key replaced successfully')
+          print(f'   Replaced 1 key block with 32 custom bytes')
+          PYTHON_EOF
+
+          git add "$LICENSE_FILE_PATH"
+
+      - name: Verify Rust syntax
+        run: |
+          set +e  # Don't exit on rustfmt failure
+          
+          if command -v rustfmt &> /dev/null; then
+            echo "Running rustfmt check..."
+            rustfmt --check crates/common/src/enterprise/license.rs 2>/dev/null
+            if [ $? -ne 0 ]; then
+              echo "ℹ️  Formatting issues detected; auto-fixing…"
+              rustfmt crates/common/src/enterprise/license.rs
+              git add crates/common/src/enterprise/license.rs
+            fi
+          else
+            echo "ℹ️  rustfmt not available; skipping format check"
+          fi
+
+          # Verify the file is valid Rust by parsing (optional, requires cargo)
+          if command -v cargo &> /dev/null; then
+            echo "Running cargo check…"
+            if cargo check -p stalwart-common --quiet 2>/dev/null; then
+              echo "✅ Rust syntax and compilation verified"
+            else
+              echo "⚠️  cargo check produced warnings (non-fatal)"
+            fi
+          fi
+          
+          set -e
+
+      - name: Commit changes on customized branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          else
+            COMMIT_MSG="${{ steps.commit_msg.outputs.msg }}"
+            git commit -m "$COMMIT_MSG"
+            echo "✅ Commit created on customized branch"
+            echo "COMMIT_CREATED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Create audit log entry
+        run: |
+          git checkout main
+          
+          AUDIT_LOG="FORK_SYNC_AUDIT_LOG.md"
+          if [ ! -f "$AUDIT_LOG" ]; then
+            cat > "$AUDIT_LOG" << 'EOF'
+          # Fork Sync Audit Log
+          
+          This log tracks all upstream synchronization events for this fork.
+          Each entry records the sync date, upstream range, and workflow run link.
+          
+          ---
+          
+          EOF
+          fi
+
+          cat >> "$AUDIT_LOG" << 'EOF'
+
+          ### Sync: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          - **Upstream Range**: [${{ steps.get_shas.outputs.old_sha }}...${{ steps.get_shas.outputs.new_sha }}](https://github.com/stalwartlabs/stalwart/compare/${{ steps.get_shas.outputs.old_sha }}...${{ steps.get_shas.outputs.new_sha }})
+          - **License Key Updated**: $( [ "$COMMIT_CREATED" = "true" ] && echo "YES" || echo "NO" )
+          - **Workflow Run**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - **Actor**: ${{ github.actor }} / ${{ github.triggering_actor }}
+          - **Trigger**: ${{ github.event_name }}
+
+          EOF
+
+          if [ "$COMMIT_CREATED" = "true" ]; then
+            git add "$AUDIT_LOG"
+            git commit -m "audit: log upstream sync $(date -u +'%Y-%m-%d')"
+            echo "✅ Audit log updated on main"
+          else
+            echo "ℹ️  Skipping audit log commit (no customization changes)"
+          fi
+
+      - name: Verify branch states before push
+        run: |
+          echo "Branch state verification:"
+          echo "  main: $(git rev-parse origin/main)"
+          if git rev-parse origin/customized >/dev/null 2>&1; then
+            echo "  customized: $(git rev-parse origin/customized)"
+          else
+            echo "  customized: (will be created)"
+          fi
+
+      - name: Push branches
+        run: |
+          # Push main (always, includes audit log if created)
+          git push origin main --force-with-lease
+          echo "✅ main pushed"
+
+          if [ "$COMMIT_CREATED" = "true" ]; then
+            # Push customized branch with key updates
+            git push --force-with-lease origin customized
+            
+            # Verify push succeeded by comparing SHAs
+            PUSHED_SHA=$(git rev-parse origin/customized)
+            LOCAL_SHA=$(git rev-parse customized)
+            if [ "$PUSHED_SHA" != "$LOCAL_SHA" ]; then
+              echo "❌ Push verification failed: remote SHA ($PUSHED_SHA) != local SHA ($LOCAL_SHA)"
+              exit 1
+            fi
+            echo "✅ customized pushed and verified"
+          else
+            echo "ℹ️  Skipping customized push (no new commits)"
+          fi
+
+      - name: Workflow summary
+        if: always()
+        run: |
+          echo "## Sync Workflow Summary"
+          echo "- **Status**: ${{ job.status }}"
+          echo "- **Run**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          echo "- **Commit Created**: $COMMIT_CREATED"
+          echo "- **Branches Updated**: main$([ "$COMMIT_CREATED" = "true" ] && echo ", customized" || echo "")"

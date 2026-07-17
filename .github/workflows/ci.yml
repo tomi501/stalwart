@@ -2,6 +2,12 @@ name: "CI"
 
 on:
   workflow_dispatch:
+  permissions:
+  id-token: write        # required by some actions that request OIDC tokens
+  contents: read         # CI mostly needs read; change to write only if jobs push/commit
+  packages: write        # used by docker/packaging steps that push images/artifacts
+  attestations: write    # used by attestation/cosign steps
+  
     inputs:
       Docker:
         required: false
@@ -11,6 +17,7 @@ on:
         required: false
         default: false
         type: boolean
+  
   push:
     tags: ["v*.*.*"]
 

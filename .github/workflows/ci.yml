@@ -1,13 +1,7 @@
 name: "CI"
 
 on:
-  workflow_dispatch:
-  permissions:
-  id-token: write        # required by some actions that request OIDC tokens
-  contents: read         # CI mostly needs read; change to write only if jobs push/commit
-  packages: write        # used by docker/packaging steps that push images/artifacts
-  attestations: write    # used by attestation/cosign steps
-  
+  workflow_dispatch:  
     inputs:
       Docker:
         required: false
@@ -20,6 +14,12 @@ on:
   
   push:
     tags: ["v*.*.*"]
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  attestations: write
 
 env:
   SCCACHE_GHA_ENABLED: true
